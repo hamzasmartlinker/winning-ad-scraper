@@ -1,10 +1,7 @@
-"""
-Winning Ad Scraper â FastAPI webhook service
-Scrapes Meta Ad Library & TikTok for winning ads via Apify,
-stores results in local SQLite + Supabase.
-"""
+"""\nWinning Ad Scraper â FastAPI webhook service\nScrapes Meta Ad Library & TikTok for winning ads via Apify,\nstores results in local SQLite + Supabase.\n"""
 
 import os
+import re
 import json
 import time
 import sqlite3
@@ -62,6 +59,10 @@ def _get_db() -> sqlite3.Connection:
             run_duration_days INTEGER,
             ad_id           TEXT,
             raw_metadata    TEXT,
+            price           TEXT,
+            landing_page_url TEXT,
+            direct_video_url TEXT,
+            direct_ad_url   TEXT,
             created_at      TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -74,13 +75,15 @@ def _insert_local(conn: sqlite3.Connection, rows: list[dict]):
         conn.execute(
             """INSERT INTO winning_ads
                (product_name, platform, brand_name, ad_text, video_url,
-                creative_url, start_date, run_duration_days, ad_id, raw_metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                creative_url, start_date, run_duration_days, ad_id, raw_metadata,
+                price, landing_page_url, direct_video_url, direct_ad_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 r["product_name"], r["platform"], r["brand_name"],
                 r["ad_text"], r["video_url"], r["creative_url"],
                 r["start_date"], r["run_duration_days"], r["ad_id"],
                 r["raw_metadata"],
+                r.get("price"), r.get("landing_page_url"), r.get("direct_video_url"), r.get("direct_ad_url"),
             ),
         )
     conn.commit()
@@ -116,12 +119,16 @@ async def _push_to_supabase(client: httpx.AsyncClient, rows: list[dict]):
                 "run_duration_days": r["run_duration_days"],
                 "ad_id": r["ad_id"],
                 "raw_metadata": r["raw_metadata"],
+                "price": r.get("price"),
+                "landing_page_url": r.get("landing_page_url"),
+                "direct_video_url": r.get("direct_video_url"),
+                "direct_ad_url": r.get("direct_ad_url"),
             }
             for r in batch
         ]
         resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code in (200, 201):
-            logger.info("Supabase batch %dâ%d uploaded", i, i + len(batch))
+            logger.info("Supabase batch %d\u2013%d uploaded", i, i + len(batch))
         else:
             logger.error("Supabase error %s: %s", resp.status_code, resp.text)
 
@@ -138,7 +145,7 @@ async def _start_actor(client: httpx.AsyncClient, actor_id: str, run_input: dict
     resp = await client.post(url, params=params, json=run_input, timeout=60)
     resp.raise_for_status()
     run_id = resp.json()["data"]["id"]
-    logger.info("Started Apify actor %s â run %s", actor_id, run_id)
+    logger.info("Started Apify actor %s \u2192 run %s", actor_id, run_id)
     return run_id
 
 
@@ -196,6 +203,14 @@ def _parse_date(val) -> Optional[datetime]:
     return None
 
 
+def _extract_price(text: str) -> Optional[str]:
+    """Extract the first price-like pattern from text."""
+    if not text:
+        return None
+    match = re.search(r'[\$\â¬\Â£\Â¥][\d,]+\.?\d*|\d+[\.,]\d{2}\s*[\$\â¬\Â£\Â¥USD EUR GBP]', text)
+    return match.group(0).strip() if match else None
+
+
 def _normalise_meta(items: list[dict], product_name: str) -> list[dict]:
     now = datetime.now(timezone.utc)
     results = []
@@ -229,6 +244,24 @@ def _normalise_meta(items: list[dict], product_name: str) -> list[dict]:
         if not ad_text:
             ad_text = item.get("body") or ""
 
+        # --- NEW: Extract enriched fields ---
+        ad_id_val = item.get("adArchiveID") or item.get("id") or ""
+        price = _extract_price(ad_text)
+        # Landing page URL
+        landing_page_url = (
+            snapshot.get("link_url")
+            or item.get("website_url")
+            or (snapshot.get("cta", {}) or {}).get("value", {}).get("link")
+            or item.get("ad_creative_link_url")
+            or ""
+        ) or None
+        # Direct video URL (HD preferred)
+        direct_video_url = None
+        if videos and isinstance(videos, list):
+            direct_video_url = videos[0].get("video_hd_url") or videos[0].get("video_sd_url") or None
+        # Direct ad URL
+        direct_ad_url = f"https://www.facebook.com/ads/library/?id={ad_id_val}" if ad_id_val else None
+
         results.append({
             "product_name": product_name,
             "platform": "Meta",
@@ -238,8 +271,12 @@ def _normalise_meta(items: list[dict], product_name: str) -> list[dict]:
             "creative_url": creative_url,
             "start_date": start.strftime("%Y-%m-%d"),
             "run_duration_days": run_days,
-            "ad_id": str(item.get("adArchiveID") or item.get("ad_archive_id") or item.get("id", "")),
+            "ad_id": str(ad_id_val),
             "raw_metadata": json.dumps(item, default=str)[:10000],
+            "price": price,
+            "landing_page_url": landing_page_url,
+            "direct_video_url": direct_video_url,
+            "direct_ad_url": direct_ad_url,
         })
     logger.info("Meta normalisation: %d/%d passed filters", len(results), len(items))
     return results
@@ -266,17 +303,42 @@ def _normalise_tiktok(items: list[dict], product_name: str) -> list[dict]:
         covers = item.get("covers") or []
         creative_url = covers[0] if covers else (item.get("cover") or "")
 
+        # --- NEW: Extract enriched fields ---
+        ad_id_val = str(item.get("id", ""))
+        ad_text_val = (item.get("text") or item.get("desc") or "")[:5000]
+        price = _extract_price(ad_text_val)
+        # Landing page URL
+        landing_page_url = (
+            item.get("webVideoUrl")
+            or (item.get("video") or {}).get("webVideoUrl")
+            or item.get("external_url")
+            or None
+        )
+        # Direct video URL
+        direct_video_url = (
+            (item.get("video") or {}).get("downloadAddr")
+            or item.get("videoUrl")
+            or None
+        )
+        # Direct ad URL
+        author_username = author.get("uniqueId") or author.get("name") or ""
+        direct_ad_url = f"https://www.tiktok.com/@{author_username}/video/{ad_id_val}" if author_username and ad_id_val else None
+
         results.append({
             "product_name": product_name,
             "platform": "TikTok",
             "brand_name": author.get("name") or author.get("nickName") or item.get("author", ""),
-            "ad_text": (item.get("text") or item.get("desc") or "")[:5000],
+            "ad_text": ad_text_val,
             "video_url": video_url,
             "creative_url": creative_url,
             "start_date": start.strftime("%Y-%m-%d"),
             "run_duration_days": run_days,
-            "ad_id": str(item.get("id", "")),
+            "ad_id": ad_id_val,
             "raw_metadata": json.dumps(item, default=str)[:10000],
+            "price": price,
+            "landing_page_url": landing_page_url,
+            "direct_video_url": direct_video_url,
+            "direct_ad_url": direct_ad_url,
         })
     logger.info("TikTok normalisation: %d/%d passed filters", len(results), len(items))
     return results
@@ -289,7 +351,7 @@ async def run_scrape(product_name: str):
     """Full scrape pipeline for one product."""
     logger.info("=== Starting scrape for: %s ===", product_name)
     async with httpx.AsyncClient() as client:
-        # 1 â Start both actors in parallel
+        # 1 \ Start both actors in parallel
         meta_input = {
             "searchQuery": product_name,
             "countryCode": COUNTRY_CODE,
@@ -304,13 +366,13 @@ async def run_scrape(product_name: str):
             _start_actor(client, "clockworks/tiktok-scraper", tiktok_input),
         )
 
-        # 2 â Poll both runs in parallel
+        # 2 \ Poll both runs in parallel
         meta_run, tiktok_run = await asyncio.gather(
             _poll_run(client, meta_run_id),
             _poll_run(client, tiktok_run_id),
         )
 
-        # 3 â Fetch datasets
+        # 3 \ Fetch datasets
         all_ads: list[dict] = []
 
         if meta_run["status"] == "SUCCEEDED":
@@ -333,14 +395,14 @@ async def run_scrape(product_name: str):
             logger.info("No winning ads to save")
             return {"total": 0, "meta": 0, "tiktok": 0}
 
-        # 4 â Save to local SQLite
+        # 4 \ Save to local SQLite
         conn = _get_db()
         try:
             _insert_local(conn, all_ads)
         finally:
             conn.close()
 
-        # 5 â Save to Supabase
+        # 5 \ Save to Supabase
         await _push_to_supabase(client, all_ads)
 
         meta_count = sum(1 for a in all_ads if a["platform"] == "Meta")
@@ -380,7 +442,7 @@ async def health():
 
 @app.post("/webhook")
 async def webhook(req: ScrapeRequest, background_tasks: BackgroundTasks):
-    """Trigger a scrape in the background â returns immediately."""
+    """Trigger a scrape in the background \u2014 returns immediately."""
     logger.info("Webhook received for product: %s", req.product_name)
     background_tasks.add_task(run_scrape, req.product_name)
     return {
