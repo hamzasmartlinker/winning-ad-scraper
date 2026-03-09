@@ -3,10 +3,10 @@
 A self-hosted webhook service that scrapes **Meta Ad Library** and **TikTok** for winning ads (running 7+ days, active in last 30 days) for a given product name.
 
 ## Stack
-- **FastAPI** â webhook server
-- **Apify** â Meta & TikTok scraping
-- **Supabase** â cloud storage
-- **SQLite** â local storage
+- **FastAPI** Ã¢ÂÂ webhook server
+- **Apify** Ã¢ÂÂ Meta & TikTok scraping
+- **Supabase** Ã¢ÂÂ cloud storage
+- **SQLite** Ã¢ÂÂ local storage
 
 ## Quick Start
 
@@ -65,6 +65,10 @@ CREATE TABLE winning_ads (
   run_duration_days INTEGER,
   ad_id             TEXT,
   raw_metadata      TEXT,
+  price             TEXT,            -- price from ad text (e.g. "$19.99")
+  landing_page_url  TEXT,            -- advertiser's destination URL
+  direct_video_url  TEXT,            -- direct playable video link
+  direct_ad_url     TEXT,            -- link to the ad/post itself
   created_at        TIMESTAMPTZ DEFAULT NOW()
 );
 ```
